@@ -2,7 +2,15 @@
 export { NirvanaClient } from './nirvana/nirvana-client.js';
 
 // ── Samsara Client ──────────────────────────────────────────────────
-export { SamsaraClient } from './samsara/samsara-client.js';
+export {
+  SamsaraClient,
+  type MarketFees,
+  type GovernanceParam,
+  type MarketGovernance,
+  feeToPercent,
+  feeToRatio,
+  governanceToFees,
+} from './samsara/samsara-client.js';
 
 // ── Config ──────────────────────────────────────────────────────────
 export { type NirvanaConfig, NIRVANA_MAINNET_CONFIG } from './models/config.js';

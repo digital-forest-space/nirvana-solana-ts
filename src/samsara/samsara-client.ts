@@ -34,6 +34,7 @@ import {
   base64Decode,
   base64Encode,
   readU64LE,
+  readU32LE,
   decodeRustDecimal,
   fromLamports,
   toLamports,
@@ -45,6 +46,62 @@ import {
 
 const NATIVE_SOL_MINT = 'So11111111111111111111111111111111111111112';
 const PRANA_DECIMALS = 6;
+
+// ---------------------------------------------------------------------------
+// Fee types
+// ---------------------------------------------------------------------------
+
+/** Fee schedule for a single navToken market (values in micro-basis-points). */
+export interface MarketFees {
+  readonly marketName: string;
+  readonly buyFeeUbps: number;
+  readonly sellFeeUbps: number;
+  readonly borrowFeeUbps: number;
+  readonly exerciseOptionFeeUbps: number;
+}
+
+/** Convert ubps to percentage (10,000 ubps = 1%). */
+export function feeToPercent(ubps: number): number {
+  return ubps / 10_000;
+}
+
+/** Convert ubps to ratio (1,000,000 ubps = 1.0). */
+export function feeToRatio(ubps: number): number {
+  return ubps / 1_000_000;
+}
+
+/** A governance parameter with its current, previous, and constraint values. */
+export interface GovernanceParam {
+  readonly previous: number;
+  readonly current: number;
+  readonly step: number;
+  readonly maximum: number;
+  readonly minimum: number;
+}
+
+/** Full governance parameters for a navToken market. */
+export interface MarketGovernance {
+  readonly marketName: string;
+  readonly buyFee: GovernanceParam;
+  readonly sellFee: GovernanceParam;
+  readonly borrowFee: GovernanceParam;
+  readonly floorRaiseCooldown: GovernanceParam;
+  readonly floorRaiseBuffer: GovernanceParam;
+  readonly floorInvestment: GovernanceParam;
+  readonly floorRaiseIncrease: GovernanceParam;
+  readonly exerciseOptionFeeUbps: number;
+}
+
+/** Extract MarketFees from a MarketGovernance using current values. */
+export function governanceToFees(gov: MarketGovernance): MarketFees {
+  return {
+    marketName: gov.marketName,
+    buyFeeUbps: gov.buyFee.current,
+    sellFeeUbps: gov.sellFee.current,
+    borrowFeeUbps: gov.borrowFee.current,
+    exerciseOptionFeeUbps: gov.exerciseOptionFeeUbps,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -2137,4 +2194,170 @@ export class SamsaraClient {
       recentBlockhash,
     });
   }
+
+  // -----------------------------------------------------------------------
+  // Fee fetching
+  // -----------------------------------------------------------------------
+
+  /**
+   * Fetch fee schedule for a single navToken market.
+   *
+   * Reads the MarketGroup account (154 bytes, owned by Mayflower) and
+   * extracts the four fee fields stored as u32 LE values in ubps.
+   */
+  async fetchMarketFees(market: NavTokenMarket): Promise<MarketFees | null> {
+    const account = await this._rpcClient.getAccountInfo(market.marketGroup);
+    const bytes = decodeAccountData(account);
+    return parseMarketGroupFees(bytes, market.name);
+  }
+
+  /**
+   * Fetch fee schedules for all given markets in a single batched RPC call.
+   * Returns a map of marketName → MarketFees (markets with unreadable accounts are omitted).
+   */
+  async fetchAllMarketFees(
+    markets: NavTokenMarket[],
+    batchSize = 100,
+  ): Promise<Map<string, MarketFees>> {
+    const addresses = markets.map((m) => m.marketGroup);
+    const accounts = await this._rpcClient.getMultipleAccounts(addresses, { batchSize });
+
+    const result = new Map<string, MarketFees>();
+    for (let i = 0; i < markets.length; i++) {
+      const bytes = decodeAccountData(accounts[i]);
+      const fees = parseMarketGroupFees(bytes, markets[i].name);
+      if (fees) result.set(markets[i].name, fees);
+    }
+    return result;
+  }
+
+  /**
+   * Fetch full governance parameters for a single navToken market.
+   *
+   * Requires two accounts: the SamsaraMarket (governance params) and
+   * the MarketGroup (exerciseOptionFee, which is not governance-voted).
+   */
+  async fetchMarketGovernance(market: NavTokenMarket): Promise<MarketGovernance | null> {
+    const accounts = await this._rpcClient.getMultipleAccounts([
+      market.samsaraMarket,
+      market.marketGroup,
+    ]);
+
+    const samsaraBytes = decodeAccountData(accounts[0]);
+    const marketGroupBytes = decodeAccountData(accounts[1]);
+
+    // Extract exerciseOptionFee from MarketGroup
+    const exerciseOptionFeeUbps =
+      marketGroupBytes.length >= 122 ? readU32LE(marketGroupBytes, 118) : 0;
+
+    return parseSamsaraMarketGovernance(samsaraBytes, market.name, exerciseOptionFeeUbps);
+  }
+
+  /**
+   * Fetch full governance parameters for all given markets in a single batched RPC call.
+   * Interleaves SamsaraMarket + MarketGroup addresses for each market.
+   */
+  async fetchAllMarketGovernance(
+    markets: NavTokenMarket[],
+    batchSize = 100,
+  ): Promise<Map<string, MarketGovernance>> {
+    // Interleave: [samsaraMarket0, marketGroup0, samsaraMarket1, marketGroup1, ...]
+    const addresses: string[] = [];
+    for (const m of markets) {
+      addresses.push(m.samsaraMarket, m.marketGroup);
+    }
+
+    const accounts = await this._rpcClient.getMultipleAccounts(addresses, { batchSize });
+
+    const result = new Map<string, MarketGovernance>();
+    for (let i = 0; i < markets.length; i++) {
+      const samsaraBytes = decodeAccountData(accounts[i * 2]);
+      const marketGroupBytes = decodeAccountData(accounts[i * 2 + 1]);
+
+      const exerciseOptionFeeUbps =
+        marketGroupBytes.length >= 122 ? readU32LE(marketGroupBytes, 118) : 0;
+
+      const gov = parseSamsaraMarketGovernance(
+        samsaraBytes,
+        markets[i].name,
+        exerciseOptionFeeUbps,
+      );
+      if (gov) result.set(markets[i].name, gov);
+    }
+    return result;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fee parsing helpers (module-level, used by SamsaraClient)
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse fee fields from a MarketGroup account (154 bytes, Mayflower program).
+ *
+ * Layout:
+ *   0-7:     discriminator
+ *   8-103:   3 × Pubkey (tenant, samsaraMarket, unknown)
+ *   104-105: u16 (unknown)
+ *   106-109: u32 buy fee (ubps, LE)
+ *   110-113: u32 sell fee (ubps, LE)
+ *   114-117: u32 borrow fee (ubps, LE)
+ *   118-121: u32 exercise option fee (ubps, LE)
+ *   122-153: reserved
+ */
+function parseMarketGroupFees(bytes: Uint8Array, name: string): MarketFees | null {
+  if (bytes.length < 122) return null;
+  return {
+    marketName: name,
+    buyFeeUbps: readU32LE(bytes, 106),
+    sellFeeUbps: readU32LE(bytes, 110),
+    borrowFeeUbps: readU32LE(bytes, 114),
+    exerciseOptionFeeUbps: readU32LE(bytes, 118),
+  };
+}
+
+/**
+ * Parse a single governance parameter block (20 useful bytes within a 32-byte block).
+ *
+ * Each block: u32 previous, u32 current, u32 step, u32 maximum, u32 minimum (all LE).
+ */
+function parseGovParam(bytes: Uint8Array, offset: number): GovernanceParam {
+  return {
+    previous: readU32LE(bytes, offset),
+    current: readU32LE(bytes, offset + 4),
+    step: readU32LE(bytes, offset + 8),
+    maximum: readU32LE(bytes, offset + 12),
+    minimum: readU32LE(bytes, offset + 16),
+  };
+}
+
+/**
+ * Parse governance parameters from a SamsaraMarket account (≥376 bytes).
+ *
+ * Governance params start at offset 152 with 32-byte stride:
+ *   152: buyFee
+ *   184: sellFee
+ *   216: borrowFee
+ *   248: floorRaiseCooldown (seconds)
+ *   280: floorRaiseBuffer (ubps)
+ *   312: floorInvestment (ubps)
+ *   344: floorRaiseIncrease (ubps)
+ */
+function parseSamsaraMarketGovernance(
+  bytes: Uint8Array,
+  name: string,
+  exerciseOptionFeeUbps: number,
+): MarketGovernance | null {
+  if (bytes.length < 376) return null;
+  return {
+    marketName: name,
+    buyFee: parseGovParam(bytes, 152),
+    sellFee: parseGovParam(bytes, 184),
+    borrowFee: parseGovParam(bytes, 216),
+    floorRaiseCooldown: parseGovParam(bytes, 248),
+    floorRaiseBuffer: parseGovParam(bytes, 280),
+    floorInvestment: parseGovParam(bytes, 312),
+    floorRaiseIncrease: parseGovParam(bytes, 344),
+    exerciseOptionFeeUbps,
+  };
 }
